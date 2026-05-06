@@ -14,7 +14,7 @@ endif()
 include(ExternalProject)
 ExternalProject_Add(secure_c
   URL               ${_secure_c_url}
-                    https://gitee.com/openeuler/libboundscheck/repository/archive/v1.1.16.tar.gz
+                    https://log.obs.cn-wulan.cloud.wulan-ai.iaas.antgroup-inc.cn:443/xuandi.cm/libboundscheck-v1.1.16.tar.gz?AccessKeyId=BLCSCH4WRWGSIUQAQZSN&Expires=1793519025&Signature=AWfXkPPf3ucY7WaGkQf%2BUgIChCs%3D
   URL_MD5           ae4865cec1bfb52f7dca03f5c05ac98a
   DOWNLOAD_DIR      download/secure_c
   PREFIX            third_party
