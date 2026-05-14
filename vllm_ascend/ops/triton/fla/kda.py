@@ -613,58 +613,91 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     if i_t * BT + i_i * BC >= T:
         return
 
+    q += (bos * H + i_h) * K
+    k += (bos * H + i_h) * K
+    g += (bos * H + i_h) * K
+    A += (bos * H + i_h) * BT
+    Aqk += (bos * H + i_h) * BT
+
     o_i = tl.arange(0, BC)
-    o_k = tl.arange(0, BK)
-    m_k = o_k < K
-    m_A = (i_t * BT + i_i * BC + o_i) < T
-    o_A = (bos + i_t * BT + i_i * BC + o_i) * H * BT + i_h * BT + i_i * BC
+    o_j = tl.arange(0, BC)
+    m_i = (i_t * BT + i_i * BC + o_i) < T
 
-    p_q = tl.make_block_ptr(
-        q + (bos * H + i_h) * K,
-        (T, K),
-        (H * K, 1),
-        (i_t * BT + i_i * BC, 0),
-        (BC, BK),
+    b_beta = tl.load(
+        beta + (bos + i_t * BT + i_i * BC + o_i) * H + i_h,
+        mask=m_i,
+        other=0,
+    )
+    b_A = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Aqk = tl.zeros([BC, BC], dtype=tl.float32)
+
+    for i_k in range(tl.cdiv(K, BK)):
+        p_q = tl.make_block_ptr(
+            q,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + i_i * BC, i_k * BK),
+            (BC, BK),
+            (1, 0),
+        )
+        p_k = tl.make_block_ptr(
+            k,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + i_i * BC, i_k * BK),
+            (BC, BK),
+            (1, 0),
+        )
+        p_g = tl.make_block_ptr(
+            g,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + i_i * BC, i_k * BK),
+            (BC, BK),
+            (1, 0),
+        )
+
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = o_k < K
+        b_g_ref = tl.load(
+            g + (i_t * BT + i_i * BC) * H * K + o_k,
+            mask=m_k,
+            other=0,
+        )
+        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_g = tl.load(p_g, boundary_check=(0, 1))
+        b_decay_l = exp(b_g - b_g_ref[None, :])
+        b_decay_r = exp(b_g_ref[None, :] - b_g)
+        b_k_l = b_k * b_decay_l * b_beta[:, None]
+        b_q_l = b_q * b_decay_l
+        b_k_r = b_k * b_decay_r
+
+        b_A += tl.dot(b_k_l, tl.trans(b_k_r))
+        b_Aqk += tl.dot(b_q_l, tl.trans(b_k_r))
+
+    b_A = tl.where(o_i[:, None] > o_j[None, :], b_A, 0.0)
+    b_Aqk = tl.where(o_i[:, None] >= o_j[None, :], b_Aqk * scale, 0.0)
+
+    p_A = tl.make_block_ptr(
+        A,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT + i_i * BC, i_i * BC),
+        (BC, BC),
         (1, 0),
     )
-    p_k = tl.make_block_ptr(
-        k + (bos * H + i_h) * K,
-        (T, K),
-        (H * K, 1),
-        (i_t * BT + i_i * BC, 0),
-        (BC, BK),
+    tl.store(p_A, b_A.to(A.dtype.element_ty), boundary_check=(0, 1))
+
+    p_Aqk = tl.make_block_ptr(
+        Aqk,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT + i_i * BC, i_i * BC),
+        (BC, BC),
         (1, 0),
     )
-    p_g = tl.make_block_ptr(
-        g + (bos * H + i_h) * K,
-        (T, K),
-        (H * K, 1),
-        (i_t * BT + i_i * BC, 0),
-        (BC, BK),
-        (1, 0),
-    )
-    b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_k = tl.load(p_k, boundary_check=(0, 1))
-    b_g = tl.load(p_g, boundary_check=(0, 1))
-
-    p_b = beta + (bos + i_t * BT + i_i * BC + o_i) * H + i_h
-    b_k = b_k * tl.load(p_b, mask=m_A, other=0)[:, None]
-
-    p_kt = k + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
-    p_gk = g + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
-
-    for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
-        b_kt = tl.load(p_kt, mask=m_k, other=0).to(tl.float32)
-        b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32)
-        b_ktg = b_kt[None, :] * exp(b_g - b_gk[None, :])
-        b_A = tl.sum(b_k * b_ktg, 1)
-        b_A = tl.where(o_i > j, b_A, 0.0)
-        b_Aqk = tl.sum(b_q * b_ktg, 1)
-        b_Aqk = tl.where(o_i >= j, b_Aqk * scale, 0.0)
-        tl.store(A + o_A + j, b_A, mask=m_A)
-        tl.store(Aqk + o_A + j, b_Aqk, mask=m_A)
-        p_kt += H * K
-        p_gk += H * K
+    tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_kda_scaled_dot_kkt_fwd(
