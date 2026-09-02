@@ -830,6 +830,7 @@ class TestQuantApplyMlpNoGeluImpact(_GeluPathBase):
             _mock_w8a8_gelu_compute(torch.zeros(1, 8)),
             patch(f"{MOE_MLP}._EXTRA_CTX") as mock_ctx,
             patch(f"{MOE_MLP}.HAS_TRITON", False),
+            patch("vllm.triton_utils.HAS_TRITON", False),
             patch("torch_npu.npu_swiglu", return_value=torch.zeros(1, 4), create=True) as mock_swiglu,
             patch("torch.nn.functional.gelu") as mock_gelu,
         ):
