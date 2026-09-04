@@ -6,5 +6,10 @@
   "Qwen/Qwen3-Embedding-0.6B": "/home/admin/model-csi/models/modelhub_124271_qwen3-embedding-0-6b-124900085_20260514164657/model",
   "deepseek-ai/dspark_qwen3_8b_block7": "/home/admin/model-csi/models/modelhub_63300053_dspark_qwen3_8b_block7-135500128_20260721180109/model",
   "LLM-Research/Meta-Llama-3.1-8B-Instruct": "/home/admin/model-csi/models/modelhub_6500027_meta-llama-3-1-8b-instruct-75300095_20250626170659/model",
-  "Qwen/Qwen3-Reranker-0.6B": "/home/admin/model-csi/models/modelhub_4700023_qwen3-reranker-0-6b-73400091_20250611102304/model"
+  "Qwen/Qwen3-Reranker-0.6B": "/home/admin/model-csi/models/modelhub_4700023_qwen3-reranker-0-6b-73400091_20250611102304/model",
+  "RedHatAI/Qwen3-8B-speculator.eagle3": "/home/admin/model-csi/models/modelhub_71200090_qwen3-8b-speculator-eagle3-145000150_20260903151220/model",
+  "Qwen/Qwen3-30B-A3B": "/home/admin/model-csi/models/modelhub_121003_qwen3-30b-a3b-94700106_20251204174645/model",
+  "Qwen/Qwen3.5-35B-A3B": "/home/admin/model-csi/models/modelhub_40500010_qwen3-5-35b-a3b-111400049_20260225105534/model",
+  "vllm-ascend/Qwen3-30B-A3B-W8A8": "/home/admin/model-csi/models/modelhub_51000048_qwen3-30b-a3b-w8a8-122100125_20260421211354/model",
+  "Qwen/Qwen2.5-VL-7B-Instruct": "/home/admin/model-csi/models/modelhub_111893_qwen2-5-vl-7b-instruct-96200137_20251211205134/model"
 }
