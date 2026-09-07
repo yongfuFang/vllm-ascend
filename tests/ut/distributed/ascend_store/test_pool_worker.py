@@ -588,6 +588,7 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
         worker = KVPoolWorker(config, use_layerwise=use_layerwise)
+        worker._uses_vllm_mooncake_connector = MagicMock(return_value=False)
         return worker
 
     def setUp(self):
@@ -717,9 +718,14 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         kwargs["invalid_block_ids"].add(7)
         self.assertEqual(worker.get_block_ids_with_load_errors(), {7})
 
-    def test_wait_for_save_waits_for_save(self):
+    def test_wait_for_save_submits_batch_without_joining_queue(self):
         worker = self._make_worker()
-        worker.kv_send_thread = MagicMock()
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import KVCacheStoreSendingThread
+
+        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
+        worker.kv_send_thread.request_queue = MagicMock()
+        save_batch = MagicMock()
+        worker.kv_send_thread.add_save_batch.return_value = save_batch
 
         req = ReqMeta(
             req_id="r1",
@@ -730,10 +736,12 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         )
         meta = AscendConnectorMetadata(set(), set())
         meta.add_request(req)
-        worker.wait_for_save(meta)
-        worker.kv_send_thread.add_stored_request.assert_called_with("r1")
-        worker.kv_send_thread.add_request.assert_called_once()
-        worker.kv_send_thread.request_queue.join.assert_called_once()
+        module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
+        with patch(f"{module}.torch.npu", create=True):
+            worker.wait_for_save(meta)
+        worker.kv_send_thread.add_save_batch.assert_called_once_with([req])
+        worker.kv_send_thread.request_queue.join.assert_not_called()
+        self.assertIs(worker._previous_save_batch, save_batch)
 
     def test_wait_for_save_skip_non_save(self):
         worker = self._make_worker()
@@ -2090,6 +2098,7 @@ class TestKVPoolWorkerTpMismatch(unittest.TestCase):
         worker = self._make_worker(
             tp_size=2, kv_role="kv_consumer", extra_config={"backend": "mooncake", "prefill_tp_size": 4}, num_kv_heads=8
         )
+        worker._uses_vllm_mooncake_connector = MagicMock(return_value=False)
         fake_cache = MagicMock()
         fake_cache.shape = [100, 16, 4, 64]
         fake_cache.__getitem__.return_value.numel.return_value = 16 * 4 * 64

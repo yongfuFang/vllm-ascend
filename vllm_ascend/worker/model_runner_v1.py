@@ -1833,24 +1833,33 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
-        # and there is no draft tokens scheduled. so it need to update the
-        # spec_decoding info in scheduler_output with async_scheduling.
-        # use deepcopy to avoid the modification has influence on the
-        # scheduler_output in engine core process.
-        # TODO(Ronald1995): deepcopy is expensive when there is a large
-        # number of requests, optimize it later.
+        # and there are no scheduled draft tokens. Isolate the fields that
+        # speculative decoding may update without copying large read-only
+        # fields such as kv_connector_metadata.
         if (
             self.use_async_scheduling
             and self.num_spec_tokens
             and self._draft_token_ids is None  # type: ignore[has-type]
         ):
-            scheduler_output = deepcopy(scheduler_output)
+            scheduler_output = replace(
+                scheduler_output,
+                num_scheduled_tokens=scheduler_output.num_scheduled_tokens.copy(),
+                scheduled_spec_decode_tokens=(
+                    scheduler_output.scheduled_spec_decode_tokens.copy()
+                ),
+            )
         pp_group = get_pp_group()
         if pp_group.world_size > 1 and not pp_group.is_last_rank:
-            new_token_ids = scheduler_output.scheduled_cached_reqs.new_token_ids
+            cached_reqs = scheduler_output.scheduled_cached_reqs
+            new_token_ids = cached_reqs.new_token_ids
             if new_token_ids and all(not token_ids for token_ids in new_token_ids):
-                scheduler_output = deepcopy(scheduler_output)
-                scheduler_output.scheduled_cached_reqs.new_token_ids = []
+                scheduler_output = replace(
+                    scheduler_output,
+                    scheduled_cached_reqs=replace(
+                        cached_reqs,
+                        new_token_ids=[],
+                    ),
+                )
 
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata

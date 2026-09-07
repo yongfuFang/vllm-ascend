@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import sys
 import threading
 import time
 from collections.abc import Callable, Generator
@@ -17,6 +18,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.kv_events import BlockStored
+from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
 from vllm.v1.kv_cache_interface import (
@@ -52,6 +54,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import
     ExternalCachedBlockPool,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    KVCacheStoreBatch,
     KVCacheStoreKeyLayerRecvingThread,
     KVCacheStoreKeyLayerSendingThread,
     KVCacheStoreLayerRecvingThread,
@@ -87,8 +90,13 @@ LAYERWISE_READ_LEASE_TTL_MS = 5 * 60 * 1000
 # A partial snapshot can be visible to readers before the rank responsible for
 # saving it has published its final layer.
 MEMCACHE_UNMATCHED_STATE = -3101
+
+VLLM_MOONCAKE_CONNECTOR_MODULE = (
+    "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector"
+)
 PARTIAL_LEASE_RETRY_COUNT = 10
 PARTIAL_LEASE_RETRY_INTERVAL_S = 0.001
+SAVE_BATCH_FAILURE_POLL_INTERVAL_S = 1.0
 
 
 class KVPoolWorker:
@@ -331,6 +339,7 @@ class KVPoolWorker:
     def _init_state_vars(self) -> None:
         self.kv_send_thread: KVTransferThread | None = None
         self.kv_recv_thread: KVTransferThread | None = None
+        self._previous_save_batch: KVCacheStoreBatch | None = None
         self._transfer_threads_started = False
         self.external_slot_release_waiter: Callable[[int], None] | None = None
         # Per-rank GVA cache: maps per-rank store key to its allocated GVA.
@@ -565,6 +574,7 @@ class KVPoolWorker:
                     ready_event_sending,
                     self.group_uses_align_state,
                     self.enable_kv_events,
+                    worker=self if self.tp_mismatch else None,
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
@@ -692,9 +702,9 @@ class KVPoolWorker:
 
     def _get_cache_block_metadata(self, cache: torch.Tensor) -> tuple[int, int, int, int]:
         tensor_num_blocks = cache.shape[0]
-        assert tensor_num_blocks % self.num_blocks == 0, (
-            "The external block size must be an integer multiple of the kernel block size."
-        )
+        assert (
+            tensor_num_blocks % self.num_blocks == 0
+        ), "The external block size must be an integer multiple of the kernel block size."
         block_size_scale = tensor_num_blocks // self.num_blocks
         block_len = cache[0].numel() * cache.element_size() * block_size_scale
         block_stride = cache.stride(0) * cache.element_size() * block_size_scale
@@ -707,6 +717,25 @@ class KVPoolWorker:
             return cache.untyped_storage().data_ptr()
         except AttributeError:
             return cache.storage().data_ptr()
+
+    @staticmethod
+    def _uses_vllm_mooncake_connector() -> bool:
+        kv_group = get_kv_transfer_group()
+        child_connectors = getattr(kv_group, "_connectors", ())
+
+        # Do not import Mooncake's optional dependencies for unrelated connector
+        # combinations. If a MooncakeConnector child exists, its defining module
+        # has already been loaded while constructing the KV transfer group.
+        mooncake_module = sys.modules.get(VLLM_MOONCAKE_CONNECTOR_MODULE)
+        mooncake_connector_type = (
+            getattr(mooncake_module, "MooncakeConnector", None)
+            if mooncake_module is not None
+            else None
+        )
+        return isinstance(mooncake_connector_type, type) and any(
+            isinstance(connector, mooncake_connector_type)
+            for connector in child_connectors
+        )
 
     def _extract_physical_layer_index(self, layer_name: str) -> int:
         base_layers = getattr(
@@ -800,6 +829,7 @@ class KVPoolWorker:
 
         self.kv_caches_base_addr = []
 
+        use_storage_extent = self._uses_vllm_mooncake_connector()
         registered_regions: dict[int, tuple[int, int]] = {}
         for cache_or_caches in kv_caches.values():
             for cache in self._as_cache_tuple(cache_or_caches):
@@ -810,7 +840,11 @@ class KVPoolWorker:
                 self.kv_caches_base_addr.append(base_addr)
                 storage_key = self._get_storage_key(cache)
                 start = base_addr
-                end = base_addr + region_len
+                end = (
+                    storage_key + cache.untyped_storage().nbytes()
+                    if use_storage_extent
+                    else base_addr + region_len
+                )
                 if storage_key in registered_regions:
                     old_start, old_end = registered_regions[storage_key]
                     registered_regions[storage_key] = (min(old_start, start), max(old_end, end))
@@ -1759,10 +1793,31 @@ class KVPoolWorker:
 
         self.current_layer = self.current_layer + 1
 
-    def wait_for_save(self, connector_metadata: AscendConnectorMetadata):
+    def wait_for_previous_save(self) -> None:
+        save_batch = self._previous_save_batch
+        if save_batch is None:
+            return
+
+        assert self.kv_send_thread is not None
+        send_thread = self.kv_send_thread
+        wait_start = time.perf_counter()
+        while True:
+            send_thread.raise_if_failed()
+            if save_batch.done.wait(timeout=SAVE_BATCH_FAILURE_POLL_INTERVAL_S):
+                break
+        elapsed = time.perf_counter() - wait_start
+        logger.debug(
+            "Previous KV save batch completed after waiting %.3f ms tp_rank=%d",
+            elapsed * 1000,
+            self.tp_rank,
+        )
+        self._previous_save_batch = None
+
+    def wait_for_save(self, connector_metadata: AscendConnectorMetadata) -> None:
         current_event = None
         assert self.kv_send_thread is not None
         send_thread = self.kv_send_thread
+        requests: list[ReqMeta] = []
 
         for request in connector_metadata.requests:
             can_save = request.can_save
@@ -1773,11 +1828,16 @@ class KVPoolWorker:
                 current_event.record()
             request.skip_null_blocks_by_group = self.group_uses_align_state
             request.current_event = current_event
-            send_thread.add_stored_request(request.req_id)
-            send_thread.add_request(request)
+            requests.append(request)
 
-        if current_event is not None:
-            send_thread.request_queue.join()
+        if not requests:
+            return
+
+        if not isinstance(send_thread, KVCacheStoreSendingThread):
+            raise TypeError(
+                f"Non-layerwise KV save requires KVCacheStoreSendingThread, but got {type(send_thread).__name__}"
+            )
+        self._previous_save_batch = send_thread.add_save_batch(requests)
 
     def retrieve_layer(
         self,
