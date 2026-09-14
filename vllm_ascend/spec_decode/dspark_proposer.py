@@ -5,14 +5,16 @@ from typing import Any
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.mla_v1 import AscendMLAMetadataBuilder
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.transformers_utils.configs.kimi_k3 import (
@@ -64,6 +66,13 @@ class AscendDSparkProposer(AscendDflashProposer):
                 f"target_vocab_size={target_vocab_size}."
             )
         super().__init__(vllm_config, device, runner=runner)
+        # Only Kimi K3 DSpark supports ACL graph mode. Other DSpark models
+        # (DeepSeek V4 eager / GLM) must keep the original eager path so their
+        # code paths stay unchanged by construction, not merely by runtime
+        # scheduling. This replaces the removed unconditional
+        # ``use_cuda_graph = False`` hard-lock with an explicit K3-only gate.
+        if not self._is_k3_dspark:
+            self.use_cuda_graph = False
         self.sample_from_anchor = getattr(self.draft_model_config.hf_config, "sample_from_anchor", True)
         if self.sample_from_anchor:
             self.num_query_per_req = self.num_speculative_tokens
@@ -97,10 +106,16 @@ class AscendDSparkProposer(AscendDflashProposer):
             dtype=self.dtype,
             device=self.device,
         )
-        # DSpark runs eager only (Ascend cudagraph unsupported on this path).
-        self.use_cuda_graph = False
-        # Max query tokens depend on whether sampling from anchor or not.
-        self.max_query_tokens = self.max_batch_size * self.num_query_per_req
+        # The inherited DFlash capacity uses the target verification width
+        # (1 + N). K3 enters ACL graph mode and must reserve graph-padding
+        # capacity for the target verification width, so it widens B*N ->
+        # B*(1+N). Non-K3 DSpark (DeepSeek V4 eager / GLM) keeps the original
+        # ``num_query_per_req`` capacity (which is already 1 + N for
+        # ``sample_from_anchor=False``) and is left unchanged.
+        if self._is_k3_dspark:
+            self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
+        else:
+            self.max_query_tokens = self.max_batch_size * self.num_query_per_req
         # Position ids for the draft query block [max_query_tokens].
         # Overrides dflash:49; v2 uses input_buffers.positions.
         self.positions = torch.zeros(
@@ -273,6 +288,59 @@ class AscendDSparkProposer(AscendDflashProposer):
     ) -> None:
         self._per_group_block_tables[gid] = block_table
         self._per_group_slot_mappings[gid] = slot_mapping
+        # The fixed-address block-table buffer is only required by K3 DSpark
+        # entering ACL graph mode. Other scenarios (DSv4 eager / GLM) keep the
+        # original path and are backfilled by _sample_dspark_tokens.
+        if not self._is_k3_dspark:
+            return
+        num_rows = block_table.shape[0]
+        buffer = self._per_group_block_table_buffers.get(gid)
+        # Anchor-first graph padding can add one virtual request whose tokens
+        # are discarded. Keep one zero block-table row for that metadata tail.
+        buffer_shape = (self.max_batch_size + 1, *block_table.shape[1:])
+        if buffer is None or buffer.shape != buffer_shape:
+            buffer = block_table.new_zeros(buffer_shape)
+            self._per_group_block_table_buffers[gid] = buffer
+        buffer[:num_rows].copy_(block_table)
+        buffer[num_rows:].zero_()
+
+    def _prepare_parallel_draft_seq_lens_cpu(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        batch_size: int,
+        num_draft_tokens_cpu: list[int] | None,
+    ) -> None:
+        # Unconditionally run the parent path first so every backend (DSv4 DSA /
+        # GLM ordinary attention / K3 MLA) keeps the original parent logic and
+        # behavior identical to before this override.
+        super()._prepare_parallel_draft_seq_lens_cpu(
+            common_attn_metadata,
+            batch_size,
+            num_draft_tokens_cpu,
+        )
+
+        # The following is the K3-only backfill and must not touch other
+        # models. Only K3 MLA consumes parallel_draft_seq_lens_cpu; DSA derives
+        # max_seqlen_kv from the canonical host mirror, while ordinary
+        # attention consumes the exact device seq_lens for parallel drafting.
+        if not self._is_k3_dspark:
+            return
+
+        # In padded synchronous scheduling, the reject count is available only
+        # in the device-side seq_lens that set_inputs_first_pass has already
+        # corrected to L_t + N. There is no pending-reject event, and the MLA
+        # builder otherwise falls back to the stale host mirror L_t + rejected_t.
+        # Publish an explicit CPU copy for MLA. The blocking D2H is confined to
+        # synchronous scheduling; async+padded keeps its overlapped reject-copy
+        # path and non-padded input preparation already has an exact host value.
+        reject_event = getattr(self.runner, "num_rejected_tokens_event", None)
+        sync_padded = num_draft_tokens_cpu is not None and reject_event is None
+        if sync_padded:
+            common_attn_metadata.parallel_draft_seq_lens_cpu = (
+                common_attn_metadata.seq_lens[: common_attn_metadata.num_reqs]
+                .detach()
+                .to("cpu", copy=True)
+            )
 
     def _sample_dspark_tokens(
         self,
@@ -346,10 +414,14 @@ class AscendDSparkProposer(AscendDflashProposer):
         num_sample_total = batch_size * self.num_speculative_tokens
         has_num_rejected = num_rejected_tokens_gpu is not None
         primary_gid = getattr(self, "kv_cache_gid", 0)
-        self._per_group_block_table_buffers = {
-            attn_group.kv_cache_group_id: self._per_group_block_tables[attn_group.kv_cache_group_id]
-            for attn_group in self.draft_attn_groups
-        }
+        # Non-K3 DSpark (DSv4 eager / GLM) keeps the original eager path: the
+        # buffer forwards the latest block table reference one step behind.
+        # K3 graph mode fills it via set_per_group_attn_metadata instead.
+        if not self._is_k3_dspark:
+            self._per_group_block_table_buffers = {
+                attn_group.kv_cache_group_id: self._per_group_block_tables[attn_group.kv_cache_group_id]
+                for attn_group in self.draft_attn_groups
+            }
         self._context_slot_mapping_buffers = None
         self._dflash_num_context = int(cad.query_start_loc_cpu[batch_size])
         self._dflash_hidden_states[: self._dflash_num_context] = target_hidden_states[: self._dflash_num_context]
@@ -435,6 +507,50 @@ class AscendDSparkProposer(AscendDflashProposer):
 
         return num_query_total, token_indices_to_sample, cad, None
 
+    def pad_query_start_loc_for_graph(
+        self,
+        query_start_loc,
+        num_input_tokens: int,
+        real_num_reqs: int,
+        graph_num_reqs: int,
+        num_query_tokens: int | None = None,
+    ) -> int:
+        """Match DSpark query metadata to the captured attention Query T.
+
+        ``num_input_tokens`` is the target verification graph width.  For the
+        K3 MLA draft, the captured FIA Query T is narrower and is supplied as
+        ``num_query_tokens``.  Other DSpark backends keep using the target
+        width because their captured attention query includes graph padding.
+        """
+        if num_query_tokens is None:
+            num_query_tokens = num_input_tokens
+
+        last_loc = int(query_start_loc.np[real_num_reqs])
+        num_metadata_reqs = real_num_reqs
+
+        for req_idx in range(real_num_reqs, graph_num_reqs):
+            last_loc = min(last_loc + self.num_query_per_req, num_query_tokens)
+            query_start_loc.np[req_idx + 1] = last_loc
+            num_metadata_reqs += 1
+
+        if last_loc < num_query_tokens:
+            query_start_loc.np[num_metadata_reqs + 1] = num_query_tokens
+            num_metadata_reqs += 1
+
+        query_start_loc.copy_to_gpu()
+        return num_metadata_reqs
+
+    def get_graph_query_num_tokens(
+        self,
+        num_input_tokens: int,
+        graph_num_reqs: int,
+    ) -> int:
+        """Return the Query T used to capture this DSpark attention graph."""
+        if not isinstance(self.draft_model_config.hf_config, K3DSparkConfig):
+            return num_input_tokens
+
+        return graph_num_reqs * self.num_query_per_req
+
     @torch.inference_mode()
     def dummy_run(
         self,
@@ -448,7 +564,10 @@ class AscendDSparkProposer(AscendDflashProposer):
         **kwargs,
     ) -> None:
         num_query_total = num_reqs * self.num_query_per_req
-        num_query_tokens = min(num_query_total if num_reqs > 0 else num_tokens, self.max_query_tokens)
+        num_query_tokens = num_query_total if num_reqs > 0 else num_tokens
+        if aclgraph_runtime_mode == CUDAGraphMode.FULL and batch_descriptor is not None:
+            num_query_tokens = batch_descriptor.num_tokens
+        num_query_tokens = min(num_query_tokens, self.max_query_tokens)
 
         (
             num_input_tokens,
@@ -457,6 +576,11 @@ class AscendDSparkProposer(AscendDflashProposer):
         ) = self.runner._sync_metadata_across_dp(num_query_tokens, is_draft_model=True)
         if num_tokens_across_dp is not None:
             num_input_tokens = int(num_tokens_across_dp[self.dp_rank].item())
+
+        graph_query_tokens = self.get_graph_query_num_tokens(
+            num_input_tokens,
+            num_reqs,
+        )
 
         if not self.use_cuda_graph:
             aclgraph_runtime_mode = CUDAGraphMode.NONE
@@ -467,17 +591,73 @@ class AscendDSparkProposer(AscendDflashProposer):
         self.token_indices_to_sample.fill_(0)
         self._pad_draft_buffers(num_query_total, num_input_tokens)
 
+        multi_steps_attn_metadata = []
+        if aclgraph_runtime_mode == CUDAGraphMode.FULL and self.draft_attn_groups:
+            query_start_loc_cpu = (
+                torch.from_numpy(self.token_arange_np[: num_reqs + 1]).clone() * self.num_query_per_req
+            )
+            query_start_loc_cpu.clamp_(max=graph_query_tokens)
+            if int(query_start_loc_cpu[-1]) < graph_query_tokens:
+                query_start_loc_cpu = torch.cat(
+                    (query_start_loc_cpu, query_start_loc_cpu.new_tensor([graph_query_tokens]))
+                )
+            num_metadata_reqs = query_start_loc_cpu.shape[0] - 1
+            query_start_loc = query_start_loc_cpu.to(self.device)
+            seq_lens_cpu = self._adjust_tensor(self.runner.optimistic_seq_lens_cpu, num_metadata_reqs)
+            seq_lens = self._adjust_tensor(self.runner.seq_lens, num_metadata_reqs)
+            causal = self.model.get_draft_attn_causal()[0]
+            per_layer_attn_metadata: dict[str, Any] = {}
+            for attn_group in self.draft_attn_groups:
+                gid = attn_group.kv_cache_group_id
+                common_attn_metadata = AscendCommonAttentionMetadata(
+                    query_start_loc=query_start_loc,
+                    query_start_loc_cpu=query_start_loc_cpu,
+                    seq_lens_cpu=seq_lens_cpu,
+                    _seq_lens_cpu=seq_lens_cpu,
+                    seq_lens_cpu_upper_bound=seq_lens_cpu,
+                    seq_lens=seq_lens,
+                    num_reqs=num_metadata_reqs,
+                    # Keep cache writes limited to real draft queries. The
+                    # graph still executes ``num_input_tokens`` rows; padding
+                    # rows have -1 slot mappings and are discarded.
+                    num_actual_tokens=num_query_total,
+                    num_input_tokens=num_input_tokens,
+                    max_query_len=self.num_query_per_req,
+                    max_seq_len=0,
+                    slot_mapping=self._per_group_query_slot_mapping_buffers[gid][:num_input_tokens],
+                    positions=self.positions,
+                    attn_state=AscendAttentionState.SpecDecoding,
+                    causal=causal,
+                    is_prefilling=torch.zeros(num_metadata_reqs, dtype=torch.bool),
+                    block_table_tensor=self._per_group_block_table_buffers[gid][:num_metadata_reqs],
+                )
+                metadata = attn_group.get_metadata_builder().build_for_graph_capture(
+                    common_attn_metadata,
+                    AscendAttentionState.SpecDecoding,
+                )
+                if hasattr(metadata, "attn_mask") and not causal:
+                    metadata.attn_mask = None
+                metadata.attn_state = AscendAttentionState.SpecDecoding
+                for layer_name in attn_group.layer_names:
+                    per_layer_attn_metadata[layer_name] = metadata
+            multi_steps_attn_metadata.append(per_layer_attn_metadata)
+
+        # K3 graph mode counts the real B*N draft queries as actual tokens,
+        # ignoring the graph-padded tail; other backends retain the pre-change
+        # ``num_input_tokens`` (which already carries the max_query_tokens cap).
+        num_actual_tokens = num_query_total if self._is_k3_dspark else num_input_tokens
+
         with set_ascend_forward_context(
-            None,
+            multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None,
             self.vllm_config,
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
-            num_actual_tokens=num_input_tokens,
+            num_actual_tokens=num_actual_tokens,
             in_profile_run=is_profile,
             batch_descriptor=batch_descriptor,
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
-            draft_attn_metadatas=[],
+            draft_attn_metadatas=multi_steps_attn_metadata,
         ):
             if is_profile:
                 self.model.precompute_and_store_context_kv(context_states, context_positions)
@@ -495,6 +675,11 @@ class AscendDSparkProposer(AscendDflashProposer):
                     token_indices_to_sample=self.token_indices_to_sample[: num_reqs * self.num_speculative_tokens],
                     target_positions=self._get_positions(num_input_tokens),
                     inputs_embeds=None,
-                    multi_steps_attn_metadata=[],
+                    multi_steps_attn_metadata=multi_steps_attn_metadata,
                     num_tokens=num_input_tokens,
                 )
+
+            forward_context = get_forward_context()
+            # TODO: checkout if _update_full_graph_params is necessary in dummy_run
+            if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
+                self._update_full_graph_params(forward_context, graph_query_tokens, multi_steps_attn_metadata)
