@@ -194,6 +194,35 @@ def test_output_norm_gate_uses_kda_fused_triton_kernel():
         output_gate,
         attention.o_norm.weight,
         attention.o_norm.eps,
+        num_valid_rows=None,
+    )
+
+
+def test_output_norm_gate_forwards_num_valid_rows_to_fused_kernel():
+    attention = AscendKimiGatedDeltaNetAttention.__new__(AscendKimiGatedDeltaNetAttention)
+    nn.Module.__init__(attention)
+    attention.o_norm = SimpleNamespace(
+        weight=nn.Parameter(torch.randn(3)),
+        eps=1e-6,
+    )
+    core_attn_out = torch.randn(1, 4, 2, 3)
+    output_gate = torch.randn(4, 2, 3)
+    num_valid_rows = torch.tensor(3, dtype=torch.int32)
+    expected = torch.randn_like(core_attn_out)
+
+    with patch(
+        "vllm_ascend.ops.kimi_kda.apply_kda_rms_norm_sigmoid_gate",
+        return_value=expected,
+    ) as fused_norm_gate:
+        actual = attention._apply_output_norm_gate(core_attn_out, output_gate, num_valid_rows)
+
+    assert actual is expected
+    fused_norm_gate.assert_called_once_with(
+        core_attn_out,
+        output_gate,
+        attention.o_norm.weight,
+        attention.o_norm.eps,
+        num_valid_rows=num_valid_rows,
     )
 
 
