@@ -181,6 +181,7 @@ from vllm_ascend.utils import (
     get_c_env,
     global_stream,
     is_hidden_state_cache_spec,
+    is_kimi_k3_model,
     kv_cache_spec_uses_sparse_sfa_c8,
     lmhead_tp_enable,
     oproj_tp_enable,
@@ -734,7 +735,25 @@ class NPUModelRunner(GPUModelRunner):
         synced_cudagraph_mode = CUDAGraphMode(_post_process_cudagraph_mode(packed_tensor))
 
         # Create a tensor for num_tokens_after_padding
-        if allow_dp_padding or is_draft_model:
+        if is_kimi_k3_model(self.model_config):
+            comm_method = select_moe_comm_method(max_tokens_across_dp, self.vllm_config, is_draft_model)
+            is_finegrained_tp = self.ascend_config.finegrained_tp_config.max_finegrained_tp_size > 1
+            # There are 4 cases where padding between DPs is required:
+            # 1. comm_method == ALLGATHER, ensure the input tensor shape of allgather is consistent;
+            # 2. comm_method == MC2, reduce communication and computation through active_mask to enhance performance;
+            # 3. when finegrained_tp is open, we need to ensure num_tokens stays
+            #    consistent within finegrained_tp_group.
+            #    TODO(zzzzwwjj): We can do dp padding in finegrained_tp_group, instead of world_group.
+            # 4. FIXME(zzzzwwjj): currently, there are some bugs can lead to worker crashes when not do dp_padding in
+            #    graph mode. Therefore, dp_padding is currently enforced in graph mode.
+            requires_dp_padding = (
+                synced_cudagraph_mode != CUDAGraphMode.NONE
+                or comm_method in {MoECommType.ALLGATHER, MoECommType.MC2}
+                or is_finegrained_tp
+            )
+        else:
+            requires_dp_padding = allow_dp_padding or is_draft_model
+        if requires_dp_padding:
             num_tokens_after_padding = torch.tensor(
                 [max_tokens_across_dp] * self.dp_size, device="cpu", dtype=torch.int32
             )
@@ -3406,7 +3425,10 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
         if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
-            num_tokens_across_dp[:] = num_tokens_padded
+            if is_kimi_k3_model(self.model_config):
+                num_tokens_across_dp[self.dp_rank] = num_tokens_padded
+            else:
+                num_tokens_across_dp[:] = num_tokens_padded
             num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
         
         if self.dynamic_eplb:

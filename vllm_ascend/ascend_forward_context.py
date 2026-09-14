@@ -18,6 +18,7 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     has_layer_idx,
     is_drafter_moe_model,
+    is_kimi_k3_model,
     is_moe_model,
 )
 
@@ -207,7 +208,13 @@ def set_ascend_forward_context(
             dp_meta = forward_context.dp_metadata
             max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()
             if forward_context.flash_comm_v1_enabled:
-                padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
+                if is_kimi_k3_model(vllm_config.model_config):
+                    # Kimi K3 reduces the DP padding cases, so each rank pads
+                    # to its own num_tokens rounded up to the TP world size
+                    # instead of the global max across DP ranks.
+                    padded_length = (num_tokens + tp_world_size - 1) // tp_world_size * tp_world_size
+                else:
+                    padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
                 pad_size = padded_length - num_tokens
                 forward_context.padded_length = padded_length
                 forward_context.pad_size = pad_size

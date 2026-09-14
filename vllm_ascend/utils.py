@@ -1431,6 +1431,25 @@ def enable_dsa_cp_with_o_proj_tp() -> bool:
     return kv_transfer_config is None or kv_transfer_config.is_kv_producer
 
 
+# Architectures registered for the Kimi K3 family (target model plus the
+# DSpark draft variant) in vllm_ascend.models.
+_KIMI_K3_ARCHITECTURES = frozenset(
+    {
+        "KimiK3ForConditionalGeneration",
+        "K3DSparkModel",
+    }
+)
+
+
+def is_kimi_k3_model(model_config) -> bool:
+    """
+    Detect a model belonging to the Kimi K3 family.
+    """
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = getattr(hf_config, "architectures", ()) or ()
+    return bool(_KIMI_K3_ARCHITECTURES.intersection(architectures))
+
+
 def check_gdn_layer(vllm_config) -> bool:
     """
     Detect a model with GDN attention from either supported HF config shape.
