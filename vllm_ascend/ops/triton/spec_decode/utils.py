@@ -94,6 +94,7 @@ def copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid(
     batch_size,  # tl.int32
     HAS_NUM_REJECTED: tl.constexpr = False,
     SAMPLE_FROM_ANCHOR: tl.constexpr = False,
+    TRAIN_ALIGNED: tl.constexpr = False,
 ):
     for req_idx in range(0, batch_size):
         ctx_start = tl.load(query_start_loc_ptr + req_idx)
@@ -120,12 +121,20 @@ def copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid(
         last_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
 
         for q_idx in range(0, num_query_per_req):
-            query_pos = last_pos + 1 + q_idx
             query_out_idx = req_idx * num_query_per_req + q_idx
+            if TRAIN_ALIGNED:
+                # Training semantics: the seed token starts the draft block at
+                # its own position p, so queries run p..p+6 and the block K/V
+                # overwrites the seed's context slot, leaving the strictly
+                # preceding context (positions < p) visible.
+                query_pos = last_pos + q_idx
+                query_cache_pos = effective_seq_len - 1 + q_idx
+            else:
+                query_pos = last_pos + 1 + q_idx
+                query_cache_pos = effective_seq_len + q_idx
 
             tl.store(out_query_positions_ptr + query_out_idx, query_pos)
 
-            query_cache_pos = effective_seq_len + q_idx
             block_num_q = query_cache_pos // block_size
             block_id_q = tl.load(block_table_ptr + req_idx * block_table_stride + block_num_q).to(tl.int64)
             slot_q = block_id_q * block_size + (query_cache_pos % block_size)

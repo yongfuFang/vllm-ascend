@@ -11,6 +11,7 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 from vllm.v1.worker.utils import AttentionGroup
 
+import vllm_ascend.envs as envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.mla_v1 import AscendMLAMetadataBuilder
@@ -74,6 +75,18 @@ class AscendDSparkProposer(AscendDflashProposer):
         if not self._is_k3_dspark:
             self.use_cuda_graph = False
         self.sample_from_anchor = getattr(self.draft_model_config.hf_config, "sample_from_anchor", True)
+        # Train-aligned draft attention (DSPARK_K3_TRAIN_ALIGNED_ATTENTION=1):
+        # query block uses training positions p..p+6 and the seed token's
+        # context K/V is excluded from the draft-visible window, matching the
+        # training mask factory's strict-prefix semantics. K3 + anchor mode only.
+        self._train_aligned_attention = bool(
+            envs.DSPARK_K3_TRAIN_ALIGNED_ATTENTION and self._is_k3_dspark and self.sample_from_anchor
+        )
+        if envs.DSPARK_K3_TRAIN_ALIGNED_ATTENTION and not self._train_aligned_attention:
+            raise RuntimeError(
+                "DSPARK_K3_TRAIN_ALIGNED_ATTENTION requires K3 DSpark with "
+                "sample_from_anchor=True."
+            )
         if self.sample_from_anchor:
             self.num_query_per_req = self.num_speculative_tokens
         else:
@@ -319,6 +332,21 @@ class AscendDSparkProposer(AscendDflashProposer):
             num_draft_tokens_cpu,
         )
 
+        if (
+            self._train_aligned_attention
+            and common_attn_metadata.parallel_draft_seq_lens_cpu is not None
+        ):
+            # Train-aligned mode shortens the draft-visible KV window by one:
+            # the query block overwrites the seed's context slot, so the FIA
+            # window is L + N - 1 instead of L + N. Keep the optimistic host
+            # mirror (consumed by the K3 MLA builder with top priority) in
+            # lockstep with the device-side value from set_inputs_first_pass.
+            # The sync-padded backfill below republishes from the already
+            # corrected device tensor and therefore needs no adjustment.
+            common_attn_metadata.parallel_draft_seq_lens_cpu = (
+                common_attn_metadata.parallel_draft_seq_lens_cpu - 1
+            )
+
         # The following is the K3-only backfill and must not touch other
         # models. Only K3 MLA consumes parallel_draft_seq_lens_cpu; DSA derives
         # max_seqlen_kv from the canonical host mirror, while ordinary
@@ -470,6 +498,7 @@ class AscendDSparkProposer(AscendDflashProposer):
                 batch_size=batch_size,
                 HAS_NUM_REJECTED=has_num_rejected,
                 SAMPLE_FROM_ANCHOR=self.sample_from_anchor,
+                TRAIN_ALIGNED=self._train_aligned_attention,
             )
         # to compute self._context_slot_mapping_buffers from dict to list
         self._context_slot_mapping_buffers = [
@@ -480,8 +509,13 @@ class AscendDSparkProposer(AscendDflashProposer):
         if has_num_rejected:
             effective_seq_lens = effective_seq_lens - num_rejected_tokens_gpu
 
+        # Train-aligned mode hides the seed's context K/V by shortening the
+        # draft-visible KV window by one; the block then occupies cache
+        # positions [L-1, L-1+N) (the kernel already rewrites the slot mapping
+        # the same way), so the window is L + N - 1.
+        kv_extra = self.num_query_per_req - (1 if self._train_aligned_attention else 0)
         cad.query_start_loc = self.arange_dflash[: batch_size + 1] * self.num_query_per_req
-        cad.seq_lens = effective_seq_lens + self.num_query_per_req
+        cad.seq_lens = effective_seq_lens + kv_extra
         cad.query_start_loc_cpu = (
             torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone() * self.num_query_per_req
         ).to(torch.int32)
@@ -494,7 +528,7 @@ class AscendDSparkProposer(AscendDflashProposer):
         cad.num_actual_tokens = num_query_total
         cad.num_input_tokens = num_query_total
         cad.max_query_len = self.num_query_per_req
-        cad.max_seq_len = cad.max_seq_len + self.num_query_per_req
+        cad.max_seq_len = cad.max_seq_len + kv_extra
         cad.slot_mapping = self._per_group_query_slot_mapping_buffers[primary_gid][:num_query_total]
         cad.positions = self.positions  # this would be sliced in attention backend
         if hasattr(self.model, "get_draft_attn_causal"):

@@ -104,8 +104,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Kimi-K3 DSpark: align the draft attention with the training semantics.
+    # When enabled, the draft query block keeps the training position ids
+    # (seed position p -> p..p+6 instead of p+1..p+7) and the seed token's
+    # context K/V is excluded from the draft-visible window (training uses a
+    # strict prefix). Default False keeps the legacy serving semantics.
+    # Only meaningful for K3 DSpark with sample_from_anchor=True.
+    "DSPARK_K3_TRAIN_ALIGNED_ATTENTION": lambda: bool(int(os.getenv("DSPARK_K3_TRAIN_ALIGNED_ATTENTION", "0"))),
 }
-
 # end-env-vars-definition
 
 
